@@ -8,6 +8,7 @@ mod tools;
 
 use agent::{Agent, AgentType};
 use clap::Parser;
+use context::{ContextPolicy, OutputCompressor};
 use llm::OpenAiClient;
 use std::sync::Arc;
 
@@ -31,6 +32,10 @@ struct Cli {
 
     #[arg(long, default_value_t = 8192)]
     max_context: usize,
+
+    /// Context trimming policy: "append-only", "pin-prefix", or "fresh"
+    #[arg(long, default_value = "pin-prefix")]
+    context_policy: String,
 
     #[arg(long)]
     system: Option<String>,
@@ -65,10 +70,20 @@ async fn main() -> anyhow::Result<()> {
         .system
         .clone()
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+
+    let context_policy = match cli.context_policy.as_str() {
+        "append-only" => ContextPolicy::AppendOnly,
+        "fresh" => ContextPolicy::FreshContext,
+        _ => ContextPolicy::PinPrefix { pinned: 4, recent: 20 },
+    };
+
     let agent_type = AgentType {
         system_prompt,
         model: cli.model.clone(),
         max_turns: cli.max_turns,
+        max_context: cli.max_context,
+        context_policy,
+        compressor: OutputCompressor::default(),
     };
 
     // 5. build Agent
