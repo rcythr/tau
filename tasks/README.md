@@ -8,7 +8,7 @@ Work them in order — each phase compiles and has passing tests before the next
 | File | Phase | Goal |
 |------|-------|------|
 | [phase-1-scaffold.md](phase-1-scaffold.md) | 1 | Cargo project, OpenAI client, bare agent loop, CLI | ✅ Complete |
-| [phase-2-context.md](phase-2-context.md) | 2 | Token counting, context budget, trimming policies, history fork/checkpoint, output compression |
+| [phase-2-context.md](phase-2-context.md) | 2 | Token counting, context budget, trimming policies, history fork/checkpoint, output compression | ✅ Complete |
 | [phase-3-tools.md](phase-3-tools.md) | 3 | Tool trait, registry, built-in tools, harness, policies, sandbox |
 | [phase-4-streaming.md](phase-4-streaming.md) | 4 | SSE streaming, AgentEvent broadcast, trajectory logger, tracing |
 | [phase-5-multiagent.md](phase-5-multiagent.md) | 5 | OrchestratorBus, LocalOrchestrator, actor tools, REPL, Docker/K8s stubs |
