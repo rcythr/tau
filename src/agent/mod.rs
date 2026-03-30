@@ -7,8 +7,9 @@ pub use events::AgentEvent;
 use crate::context::{
     ApproxTokenizer, ContextBudget, ContextManager, ConversationHistory, Tokenizer,
 };
-use crate::llm::types::{CompletionRequest, StopReason};
+use crate::llm::types::{CompletionRequest, Message, StopReason};
 use crate::llm::LlmClient;
+use crate::tools::ToolOutput;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -28,10 +29,11 @@ impl Agent {
 
         let tokenizer = Arc::new(ApproxTokenizer);
         let system_tokens = tokenizer.count(&agent_type.system_prompt);
+        let tool_schema_tokens = agent_type.tools.schema_tokens(tokenizer.as_ref());
         let budget = ContextBudget::new(
             agent_type.max_context,
             system_tokens,
-            0,   // tool_schema_tokens — Phase 3
+            tool_schema_tokens,
             1024, // reserved_for_response
         );
         let context_mgr = ContextManager::new(
@@ -62,7 +64,7 @@ impl Agent {
 
     pub async fn run(&mut self, initial_prompt: &str) -> anyhow::Result<String> {
         let max_turns = self.agent_type.max_turns;
-        self.history.push(crate::llm::types::Message::user(initial_prompt));
+        self.history.push(Message::user(initial_prompt));
 
         for turn in 0..max_turns {
             let conversation = self.history.conversation();
@@ -91,10 +93,13 @@ impl Agent {
                 v
             };
 
+            let tool_defs = self.agent_type.tools.to_definitions();
+            let tools_opt = if tool_defs.is_empty() { None } else { Some(tool_defs) };
+
             let req = CompletionRequest {
                 model: self.agent_type.model.clone(),
                 messages: messages_to_send,
-                tools: None,
+                tools: tools_opt,
                 stream: false,
                 max_tokens: None,
                 temperature: None,
@@ -106,19 +111,65 @@ impl Agent {
 
             match stop_reason {
                 StopReason::EndTurn => {
-                    self.history.push(crate::llm::types::Message::assistant_text(&text));
+                    self.history.push(Message::assistant_text(&text));
                     return Ok(text);
                 }
                 StopReason::ToolUse => {
-                    // Phase 3: tool handling; for now return text
-                    self.history.push(crate::llm::types::Message::assistant_text(&text));
-                    return Ok(text);
+                    let tool_calls = response.tool_calls();
+
+                    // Record assistant turn with tool calls
+                    self.history.push(Message::assistant_with_tool_calls(
+                        if text.is_empty() { None } else { Some(text) },
+                        tool_calls.clone(),
+                    ));
+
+                    // Execute each call sequentially (parallel execution: Phase 5)
+                    for call in &tool_calls {
+                        self.emit(AgentEvent::ToolCalled {
+                            agent_id: self.id.clone(),
+                            call: call.clone(),
+                        });
+
+                        let result = self.agent_type.harness.call(&self.agent_type.tools, call).await;
+                        let output = match result {
+                            Ok(out) => out,
+                            Err(e) => {
+                                self.emit(AgentEvent::ToolBlocked {
+                                    agent_id: self.id.clone(),
+                                    call: call.clone(),
+                                    reason: e.to_string(),
+                                });
+                                ToolOutput::error(e.to_string())
+                            }
+                        };
+
+                        // Apply compressor: per-tool override or global
+                        let tool_compressor = self
+                            .agent_type
+                            .tools
+                            .find(&call.function.name)
+                            .and_then(|t| t.compressor())
+                            .unwrap_or_else(|| self.agent_type.compressor.clone());
+
+                        let (compressed_content, was_compressed) =
+                            tool_compressor.compress(&output.content);
+
+                        self.emit(AgentEvent::ToolResult {
+                            agent_id: self.id.clone(),
+                            call_id: call.id.clone(),
+                            output: compressed_content.clone(),
+                            compressed: was_compressed,
+                        });
+
+                        self.history.push(Message::tool_result(&call.id, &compressed_content));
+                    }
+                    // Continue the loop to let the agent respond after tool results
                 }
                 StopReason::MaxTokens => {
                     anyhow::bail!("max_tokens exceeded");
                 }
                 StopReason::Other(_) => {
-                    self.history.push(crate::llm::types::Message::assistant_text(&text));
+                    self.history.push(Message::assistant_text(&text));
                     return Ok(text);
                 }
             }
