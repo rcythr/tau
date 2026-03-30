@@ -9,8 +9,10 @@ mod tools;
 use agent::{Agent, AgentType};
 use clap::Parser;
 use context::{ContextPolicy, OutputCompressor};
+use harness::{AllowList, CompositePolicy, DenyList, NoSandbox, ToolHarness};
 use llm::OpenAiClient;
 use std::sync::Arc;
+use tools::ToolRegistry;
 
 #[derive(Parser)]
 #[command(name = "tau", about = "Local LLM agent")]
@@ -47,6 +49,18 @@ struct Cli {
     /// Verbose: print token counts etc.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Allow only these tools (repeatable). Omit to allow all.
+    #[arg(long = "tool", value_name = "NAME")]
+    tools_allow: Vec<String>,
+
+    /// Deny these tools (repeatable).
+    #[arg(long = "no-tool", value_name = "NAME")]
+    tools_deny: Vec<String>,
+
+    /// Sandbox mode: none, landlock, bwrap (default: none)
+    #[arg(long, default_value = "none")]
+    sandbox: String,
 }
 
 #[tokio::main]
@@ -77,6 +91,47 @@ async fn main() -> anyhow::Result<()> {
         _ => ContextPolicy::PinPrefix { pinned: 4, recent: 20 },
     };
 
+    // Build tool policy
+    let harness = if !cli.tools_allow.is_empty() {
+        // --tool flags: build AllowList with static lifetime via leak
+        let names: Vec<&'static str> = cli
+            .tools_allow
+            .iter()
+            .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
+            .collect();
+        ToolHarness::new(AllowList(names), NoSandbox)
+    } else if !cli.tools_deny.is_empty() {
+        // --no-tool flags: build DenyList
+        let names: Vec<&'static str> = cli
+            .tools_deny
+            .iter()
+            .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
+            .collect();
+        // Optionally compose with bash deny list for safety
+        let deny = DenyList(names);
+        ToolHarness::new(
+            CompositePolicy(vec![Box::new(deny)]),
+            NoSandbox,
+        )
+    } else {
+        ToolHarness::permissive()
+    };
+
+    // Handle sandbox selection (landlock/bwrap are stubs for now)
+    let harness = match cli.sandbox.as_str() {
+        #[cfg(target_os = "linux")]
+        "landlock" => {
+            use harness::sandbox::LandlockSandbox;
+            // We can't reuse harness above because of move, rebuild
+            let _ = harness; // drop previous
+            ToolHarness::new(
+                harness::AllowAll,
+                LandlockSandbox { allowed_rw_paths: vec![], allowed_ro_paths: vec![] },
+            )
+        }
+        _ => harness,
+    };
+
     let agent_type = AgentType {
         system_prompt,
         model: cli.model.clone(),
@@ -84,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
         max_context: cli.max_context,
         context_policy,
         compressor: OutputCompressor::default(),
+        tools: Arc::new(ToolRegistry::default()),
+        harness: Arc::new(harness),
     };
 
     // 5. build Agent
